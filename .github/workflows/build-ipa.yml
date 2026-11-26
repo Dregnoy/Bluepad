@@ -1,0 +1,52 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project and build
+        run: |
+          if [ -f "SuperposeAI/project.yml" ]; then
+            cd SuperposeAI
+          elif [ ! -f "project.yml" ]; then
+            echo "error: project.yml not found in repo root or SuperposeAI/ subfolder."
+            ls -la
+            exit 1
+          fi
+
+          xcodegen generate
+          xcodebuild build \
+            -project SuperposeAI.xcodeproj \
+            -scheme SuperposeAI \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+          mkdir -p "$GITHUB_WORKSPACE/Payload"
+          cp -R build/Build/Products/Release-iphoneos/SuperposeAI.app "$GITHUB_WORKSPACE/Payload/"
+
+      - name: Package IPA
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          zip -r SuperposeAI.ipa Payload
+
+      - name: Upload SuperposeAI.ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: SuperposeAI-IPA
+          path: SuperposeAI.ipa
