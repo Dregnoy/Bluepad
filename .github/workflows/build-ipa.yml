@@ -1,52 +1,133 @@
-name: Build iOS IPA
+name: Build & Test BluePad iOS
 
 on:
   push:
     branches: [ main, master ]
+    paths:
+      - "bluepad-ios/**"
+      - ".github/workflows/build-bluepad.yml"
+      - ".github/workflows/build-ios.yml"
   workflow_dispatch:
 
+concurrency:
+  group: bluepad-ios
+  cancel-in-progress: true
+
 jobs:
-  build-ipa:
-    runs-on: macos-latest
+  build-and-test:
+    runs-on: macos-15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Generate Xcode project and build
+      - name: Detect project directory
+        id: proj
         run: |
-          if [ -f "SuperposeAI/project.yml" ]; then
-            cd SuperposeAI
-          elif [ ! -f "project.yml" ]; then
-            echo "error: project.yml not found in repo root or SuperposeAI/ subfolder."
+          if [ -f "project.yml" ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f "bluepad-ios/project.yml" ]; then
+            echo "dir=bluepad-ios" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::bluepad-ios/project.yml veya project.yml bulunamadi!"
             ls -la
             exit 1
           fi
 
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode project
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
           xcodegen generate
-          xcodebuild build \
-            -project SuperposeAI.xcodeproj \
-            -scheme SuperposeAI \
+          plutil -p BluePad/Resources/Info.plist | grep -q NSBluetoothAlwaysUsageDescription
+          plutil -p BluePad/Resources/Info.plist | grep -q bluetooth-peripheral
+
+      - name: Pick available iOS Simulator destination
+        id: sim
+        run: |
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          best = None
+          for rt, devs in sorted(data.get("devices", {}).items(), reverse=True):
+              if "iOS" not in rt:
+                  continue
+              for d in devs:
+                  if d.get("isAvailable") and "iPhone" in d.get("name", ""):
+                      best = (d["udid"], d["name"])
+                      break
+              if best:
+                  break
+          if best:
+              print(best[0])
+          ')
+          if [ -z "$SIM_ID" ]; then
+            echo "::error::Kullanilabilir iOS Simulator bulunamadi."
+            xcrun simctl list runtimes available
+            exit 1
+          fi
+          echo "Picked simulator UDID: $SIM_ID"
+          echo "udid=$SIM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run BluePadTests on iOS Simulator
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -o pipefail
+          if ! xcodebuild test \
+            -project BluePad.xcodeproj \
+            -scheme BluePad \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild_test.log; then
+            grep -E "error:|fatal error:|FAIL|\*\* TEST FAILED \*\*" xcodebuild_test.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 65
+          fi
+
+      - name: Build unsigned Release iphoneos app
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -o pipefail
+          if ! xcodebuild clean build \
+            -project BluePad.xcodeproj \
+            -scheme BluePad \
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGN_IDENTITY="" 2>&1 | tee xcodebuild_release.log; then
+            grep -E "error:|fatal error:|\*\* BUILD FAILED \*\*" xcodebuild_release.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 65
+          fi
 
-          mkdir -p "$GITHUB_WORKSPACE/Payload"
-          cp -R build/Build/Products/Release-iphoneos/SuperposeAI.app "$GITHUB_WORKSPACE/Payload/"
-
-      - name: Package IPA
+      - name: Package unsigned BluePad.ipa
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
-          cd "$GITHUB_WORKSPACE"
-          zip -r SuperposeAI.ipa Payload
+          plutil -p build/Build/Products/Release-iphoneos/BluePad.app/Info.plist | grep -q NSBluetoothAlwaysUsageDescription
+          plutil -p build/Build/Products/Release-iphoneos/BluePad.app/Info.plist | grep -q bluetooth-peripheral
+          mkdir -p out/Payload
+          cp -R build/Build/Products/Release-iphoneos/BluePad.app out/Payload/BluePad.app
+          cd out
+          zip -qry ../BluePad.ipa Payload
+          ls -lh ../BluePad.ipa
 
-      - name: Upload SuperposeAI.ipa
+      - name: Upload unsigned BluePad.ipa artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SuperposeAI-IPA
-          path: SuperposeAI.ipa
+          name: BluePad-Unsigned-IPA
+          path: ${{ steps.proj.outputs.dir }}/BluePad.ipa
+          if-no-files-found: error
